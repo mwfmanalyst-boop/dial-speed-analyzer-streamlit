@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local venv
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local Drive cache (downloaded partitions)
+drive_cache/
+
+# OS noise
+.DS_Store
+Thumbs.db
