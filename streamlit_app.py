@@ -399,14 +399,56 @@ def create_subfolder(drive, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
     return drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()["id"]
 
-def download_file(drive, file_id: str, local_path: str):
+# --- replace the existing download_file() with this ---
+def download_file(drive, file_id: str, local_path: str, *, max_attempts: int = 4):
+    """
+    Robust Google Drive downloader:
+      - chunked download with small chunks + retries
+      - exponential backoff
+      - final fallback: single-shot execute() to avoid chunked TLS issues
+    """
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    request = drive.files().get_media(fileId=file_id)
-    with io.FileIO(local_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    tmp_path = local_path + ".part"
+
+    # Clean any previous partial
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Try chunked first
+            request = drive.files().get_media(fileId=file_id)
+            with io.FileIO(tmp_path, "wb") as fh:
+                # smaller chunks reduce TLS flakiness on some networks
+                downloader = MediaIoBaseDownload(fh, request, chunksize=256 * 1024)
+                done = False
+                while not done:
+                    # increase retries for transient errors
+                    _, done = downloader.next_chunk(num_retries=5)
+            os.replace(tmp_path, local_path)
+            return  # success
+        except Exception as e:
+            # Last attempt: fallback to one-shot (in-memory) download
+            if attempt == max_attempts:
+                try:
+                    content = drive.files().get_media(fileId=file_id).execute(num_retries=5)
+                    with open(tmp_path, "wb") as fh:
+                        fh.write(content)
+                    os.replace(tmp_path, local_path)
+                    return
+                except Exception:
+                    # cleanup and re-raise the original error
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise e
+            # Backoff before next attempt
+            time.sleep(min(2 ** attempt, 10))
 
 def upload_file(drive, parent_id: str, local_path: str):
     name = os.path.basename(local_path)
@@ -451,7 +493,11 @@ def ensure_local_partitions_for_dates(drive, root_id: str, dates_needed: Set[str
             if f.get("mimeType") != "application/vnd.google-apps.folder"
         ]
         for f in files_to_download:
-            download_file(drive, f["id"], os.path.join(local_dir, f["name"]))
+            try:
+                download_file(drive, f["id"], os.path.join(local_dir, f["name"]))
+            except Exception as e:
+                # keep going; show a warning for the specific file
+                st.warning(f"Could not download **{f.get('name','(unnamed)')}** ({f.get('id')}): {e}")
 
 def upload_new_local_files(drive, root_id: str, dates_affected: Set[str]):
     for ds in dates_affected:
