@@ -18,6 +18,46 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 from streamlit_option_menu import option_menu
+# --- Lottie helpers (use .lottie URL you shared) ---
+import streamlit.components.v1 as components
+from contextlib import contextmanager
+
+DOTLOTTIE_URL = "https://lottie.host/92b412e7-ce8e-4e58-b972-ba49942e7f59/7h76KeUpKg.lottie"
+# (Optional: a separate success animation if you have one)
+DOTLOTTIE_SUCCESS_URL = DOTLOTTIE_URL
+
+def dotlottie_player(src: str, height: int = 180, loop: bool = True, speed: float = 1.0, bg: str = "transparent"):
+    components.html(
+        f"""
+        <div style="width:100%;display:flex;justify-content:center;">
+          <dotlottie-player
+            src="{src}"
+            autoplay
+            {"loop" if loop else ""}
+            speed="{speed}"
+            background="{bg}"
+            style="width:100%;max-width:{int(height*1.6)}px;height:{height}px">
+          </dotlottie-player>
+        </div>
+        <script type="module"
+          src="https://unpkg.com/@dotlottie/player-component@latest/dist/dotlottie-player.mjs">
+        </script>
+        """,
+        height=height + 12,
+    )
+
+@contextmanager
+def lottie_spinner(text: str = "", height: int = 160, loop: bool = True, speed: float = 1.0, src: str = DOTLOTTIE_URL):
+    ph = st.empty()
+    try:
+        with ph.container():
+            if text:
+                st.write(text)
+            dotlottie_player(src=src, height=height, loop=loop, speed=speed)
+        yield
+    finally:
+        ph.empty()
+
 
 # -------------------------------------------------------------------
 # App config
@@ -692,7 +732,10 @@ with st.sidebar:
     all_needed_dates = {d.strftime(DATE_FMT_QUERY) for d in pd.date_range(d1, d2, freq="D")}
     missing_dates = all_needed_dates - list_local_dates()
     if missing_dates:
-        with st.spinner(f"Syncing {len(missing_dates)} date partition(s) from Database Server..."):
+        with lottie_spinner(
+                text=f"Syncing {len(missing_dates)} date partition(s) from Database Server...",
+                height=150, loop=True, speed=1.05
+        ):
             ensure_local_partitions_for_dates(drive, root_folder_id, missing_dates)
 
     all_campaigns = dm.get_all_campaigns()
@@ -742,7 +785,7 @@ if selected_tab == "Dashboard":
     else:
         d1q, d2q = d1.strftime(DATE_FMT_QUERY), d2.strftime(DATE_FMT_QUERY)
 
-        @st.cache_data(show_spinner="Running analytics...")
+        @st.cache_data(show_spinner=False)
         def compute_all(d1q, d2q, camps, pvals):
             summary_by_camp = dm.get_summary(d1q, d2q, camps, ["CAMPAIGN"], pvals)
             summary_by_date = dm.get_summary(d1q, d2q, camps, ["Date"], pvals)
@@ -757,9 +800,11 @@ if selected_tab == "Dashboard":
             stats = dm.get_overall_stats(d1q, d2q, camps, pvals)
             return summary_by_camp, summary_by_date, weekly_summary, by_interval, dashboard, stats
 
-        by_camp, by_date, by_week, by_interval, dashboard, stats = compute_all(
-            d1q, d2q, tuple(st.session_state.selected_campaigns), percentiles
-        )
+
+        with lottie_spinner(text="Running analytics...", height=140, loop=True, speed=1.1):
+            by_camp, by_date, by_week, by_interval, dashboard, stats = compute_all(
+                d1q, d2q, tuple(st.session_state.selected_campaigns), percentiles
+            )
 
         render_cards(stats, percentiles)
         st.markdown("<br>", unsafe_allow_html=True)
@@ -806,11 +851,19 @@ elif selected_tab == "Import Data":
             merged = pd.concat(dfs, ignore_index=True)
             touched = dm.write_partitioned_parquet(merged)
             try:
-                with st.spinner(f"Uploading {len(touched)} date partition(s) to Database..."):
+                with lottie_spinner(
+                        text=f"Uploading {len(touched)} date partition(s) to Database...",
+                        height=150, loop=True
+                ):
                     upload_new_local_files(drive, root_folder_id, touched)
+
                 st.success(f"Successfully imported {total_rows:,} rows across {len(touched)} date partition(s).")
-                st.balloons()
+
+                # celebratory animation instead of balloons
+                dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=180, loop=False, speed=1.0)
+
                 compute_all.clear()
+
             except Exception as e:
                 st.error(f"Data was imported locally, but the upload to Database failed: {e}")
         progress_bar.empty()
@@ -831,10 +884,17 @@ elif selected_tab == "Manage Data":
         sel_dates = st.multiselect("Select date partitions to delete", options=preselect)
         if st.button("Delete Selected Dates", type="primary", disabled=(not sel_dates), use_container_width=True):
             try:
-                with st.spinner(f"Deleting {len(sel_dates)} date partition(s)..."):
+                with lottie_spinner(
+                        text=f"Deleting {len(sel_dates)} date partition(s)...",
+                        height=150, loop=True
+                ):
                     delete_dates_remote_and_local(drive, root_folder_id, set(sel_dates))
+
                 st.success(f"Successfully deleted {len(sel_dates)} date partition(s).")
+                dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=160, loop=False)
+
                 st.rerun()
+
             except Exception as e:
                 st.error(f"An error occurred during deletion: {e}")
 
