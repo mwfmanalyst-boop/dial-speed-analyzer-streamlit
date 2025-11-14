@@ -5,7 +5,6 @@ import json
 import time
 import shutil
 import hashlib
-import ssl  # <-- NEW: to detect SSL-specific errors
 from datetime import datetime, timedelta, date
 from dateutil import tz
 from typing import Dict, List, Tuple, Optional, Set
@@ -392,103 +391,21 @@ st.markdown('<div class="main-content">', unsafe_allow_html=True)
 # -------------------------------------------------------------------
 @st.cache_resource(show_spinner="Connecting to Database Server...")
 def get_drive_service():
-    """
-    Build a Google Drive client using the service account in st.secrets.
-
-    If there is an SSL/TLS problem in the hosting environment, we raise a
-    clear RuntimeError so the caller can show a meaningful message instead
-    of a confusing low-level SSLError.
-    """
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError(
-            "Service account config missing. Add `gcp_service_account` in Streamlit secrets."
-        )
-
+        raise RuntimeError("Service account missing. Add [gcp_service_account] to secrets.")
     info = st.secrets["gcp_service_account"]
     if isinstance(info, str):
         info = json.loads(info)
-
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
-
-    try:
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except ssl.SSLError as e:
-        # Wrap SSL errors in a clearer message for the UI
-        raise RuntimeError(
-            "SSL error while connecting to Google Drive. "
-            "This is usually due to network/SSL issues in the hosting environment, "
-            "not your app code. Please check that outbound HTTPS to Google APIs "
-            "is allowed from this environment."
-        ) from e
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def get_drive_folder_id() -> str:
     fid = st.secrets.get("drive_folder_id")
     if not fid:
         raise RuntimeError("`drive_folder_id` missing from secrets.")
     return fid
-def init_drive_root():
-    """
-    Resolve the Drive root folder we will use for partitions.
-
-    Supports:
-    - Normal 'My Drive' folders
-    - Shared Drive folders
-    - Shortcuts pointing to either of the above
-
-    Validates that:
-    - drive_folder_id exists
-    - It ultimately points to a FOLDER (not a Shared Drive id, file, etc.)
-    """
-    drive = get_drive_service()
-    raw_id = get_drive_folder_id()  # what you put in st.secrets["drive_folder_id"]
-
-    try:
-        meta = drive.files().get(
-            fileId=raw_id,
-            fields="id,name,mimeType,driveId,shortcutDetails",
-            supportsAllDrives=True,
-        ).execute()
-    except HttpError as e:
-        # Most common issues:
-        #  - ID is from a Shared Drive itself, not from a folder
-        #  - Service account does not have access to that Shared Drive/folder
-        raise RuntimeError(
-            "drive_folder_id does not point to a visible file/folder for this "
-            "service account.\n\n"
-            "If you are using a Shared Drive:\n"
-            "  1) Open the folder that actually contains your Date=YYYY-MM-DD "
-            "     subfolders in the browser.\n"
-            "  2) Copy the link and use the ID after '/folders/' (NOT the 'drives' ID).\n"
-            "  3) Share that folder (or the Shared Drive) with the service account "
-            "     email as at least Viewer/Contributor."
-        ) from e
-
-    # If it's a shortcut, resolve the target
-    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-        target_id = meta["shortcutDetails"]["targetId"]
-        meta = drive.files().get(
-            fileId=target_id,
-            fields="id,name,mimeType,driveId",
-            supportsAllDrives=True,
-        ).execute()
-    else:
-        target_id = meta["id"]
-
-    if meta["mimeType"] != "application/vnd.google-apps.folder":
-        raise RuntimeError(
-            f"`drive_folder_id` must be a FOLDER id, but it points to an item with "
-            f"mimeType={meta['mimeType']}.\n\n"
-            "If you pasted a Shared Drive ID (from a URL containing '/drives/'), "
-            "that will NOT work. You must create/select a folder inside that "
-            "Shared Drive and use its '/folders/...' ID instead."
-        )
-
-    root_name = meta.get("name")
-    root_drive_id = meta.get("driveId")  # will be non-empty for Shared Drives
-
-    return drive, target_id, root_name, root_drive_id
 
 DRIVE_LIST_KW = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives")
 
@@ -524,8 +441,7 @@ def create_subfolder(drive, parent_id: str, name: str) -> str:
 
 def download_file(drive, file_id: str, local_path: str):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-
+    request = drive.files().get_media(fileId=file_id)
     with io.FileIO(local_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -558,52 +474,26 @@ def list_local_dates() -> Set[str]:
         return set()
     return {n.split("Date=")[-1] for n in os.listdir(LOCAL_CACHE_DIR) if n.startswith("Date=")}
 
-def ensure_local_partitions_for_dates(drive, root_id: Optional[str], dates_needed: Set[str]):
-    """
-    Ensure local parquet partitions exist for the given dates.
-
-    If `drive`/`root_id` are not available (e.g. Drive is down), this becomes a NO-OP:
-    we simply rely on whatever is already in the local cache.
-    """
+def ensure_local_partitions_for_dates(drive, root_id: str, dates_needed: Set[str]):
     os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
     if not dates_needed:
         return
+    folders_on_drive = {f["name"]: f for f in list_children(drive, root_id, "application/vnd.google-apps.folder")}
+    for ds in sorted(list(dates_needed)):
+        part_name, local_dir = f"Date={ds}", local_partition_dir(ds)
+        if os.path.isdir(local_dir) and os.listdir(local_dir):
+            continue
+        remote_folder = folders_on_drive.get(part_name)
+        if not remote_folder:
+            continue
+        files_to_download = [
+            f for f in list_children(drive, remote_folder["id"])
+            if f.get("mimeType") != "application/vnd.google-apps.folder"
+        ]
+        for f in files_to_download:
+            download_file(drive, f["id"], os.path.join(local_dir, f["name"]))
 
-    # If Drive is not available, we can't sync – just return silently
-    if drive is None or not root_id:
-        return
-
-    try:
-        folders_on_drive = {
-            f["name"]: f
-            for f in list_children(drive, root_id, "application/vnd.google-apps.folder")
-        }
-        for ds in sorted(list(dates_needed)):
-            part_name, local_dir = f"Date={ds}", local_partition_dir(ds)
-            if os.path.isdir(local_dir) and os.listdir(local_dir):
-                continue
-            remote_folder = folders_on_drive.get(part_name)
-            if not remote_folder:
-                continue
-            files_to_download = [
-                f
-                for f in list_children(drive, remote_folder["id"])
-                if f.get("mimeType") != "application/vnd.google-apps.folder"
-            ]
-            for f in files_to_download:
-                download_file(drive, f["id"], os.path.join(local_dir, f["name"]))
-    except Exception as e:
-        st.warning(f"Unable to sync partitions from Database Server: {e}")
-
-def upload_new_local_files(drive, root_id: Optional[str], dates_affected: Set[str]):
-    """
-    Push new / updated local parquet files to Google Drive.
-
-    If Drive is unavailable, this function becomes a NO-OP.
-    """
-    if drive is None or not root_id:
-        return
-
+def upload_new_local_files(drive, root_id: str, dates_affected: Set[str]):
     for ds in dates_affected:
         part_dir = local_partition_dir(ds)
         if not os.path.isdir(part_dir):
@@ -614,35 +504,14 @@ def upload_new_local_files(drive, root_id: Optional[str], dates_affected: Set[st
             if os.path.isfile(fpath):
                 upload_file(drive, dest_id, fpath)
 
-def delete_dates_remote_and_local(drive, root_id: Optional[str], dates_to_delete: Set[str]):
-    """
-    Delete given date partitions from remote (if available) and local cache.
-    If Drive is unavailable, this will still delete local cache safely.
-    """
-    folders_on_drive: Dict[str, Dict] = {}
-    if drive is not None and root_id:
-        try:
-            folders_on_drive = {
-                f["name"]: f
-                for f in list_children(drive, root_id, "application/vnd.google-apps.folder")
-            }
-        except Exception as e:
-            st.warning(f"Unable to load remote folders from Database Server: {e}")
-
+def delete_dates_remote_and_local(drive, root_id: str, dates_to_delete: Set[str]):
+    folders_on_drive = {f["name"]: f for f in list_children(drive, root_id, "application/vnd.google-apps.folder")}
     for ds in dates_to_delete:
         part_name = f"Date={ds}"
-        remote_folder = folders_on_drive.get(part_name)
-
-        # Try remote delete if possible
-        if remote_folder and drive is not None:
-            try:
-                for f in list_children(drive, remote_folder["id"]):
-                    delete_file_or_folder(drive, f["id"])
-                delete_file_or_folder(drive, remote_folder["id"])
-            except Exception as e:
-                st.warning(f"Failed to delete remote data for {ds}: {e}")
-
-        # Always delete local cache
+        if (remote_folder := folders_on_drive.get(part_name)):
+            for f in list_children(drive, remote_folder["id"]):
+                delete_file_or_folder(drive, f["id"])
+            delete_file_or_folder(drive, remote_folder["id"])
         local_dir = local_partition_dir(ds)
         if os.path.isdir(local_dir):
             shutil.rmtree(local_dir, ignore_errors=True)
@@ -814,97 +683,13 @@ def render_cards(stats: Dict[str, int], percentiles: Tuple[int, ...]):
 # -------------------------------------------------------------------
 # Main after login
 # -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# Main after login
-# -------------------------------------------------------------------
-dm = get_dm()  # Always available for local parquet cache
-
-drive = None
-root_folder_id = None
-DRIVE_AVAILABLE = False
-DRIVE_ERROR_MSG = ""
-
 try:
-    # NEW: uses Shared-Drive-aware initializer + validates folder
-    drive, root_folder_id, root_name, root_drive_id = init_drive_root()
-    DRIVE_AVAILABLE = True
-
-    # Optional small caption so YOU can see what it connected to
-    where = "Shared Drive" if root_drive_id else "My Drive"
-    st.caption(f"✅ Connected to folder '{root_name}' on {where}.")
-
+    drive = get_drive_service()
+    root_folder_id = resolve_shortcut(drive, get_drive_folder_id())
+    dm = get_dm()
 except Exception as e:
-    DRIVE_AVAILABLE = False
-    DRIVE_ERROR_MSG = str(e)
-
-    st.error("Could not connect to Google Drive. The app is running in local-only mode.")
-    st.exception(e)  # show full traceback so you can see the exact cause
-
-    if "SSL error while connecting to Google Drive" in DRIVE_ERROR_MSG:
-        st.warning(
-            "⚠️ SSL error while talking to Google Drive.\n\n"
-            "Most likely outbound HTTPS to Google APIs is blocked or TLS is misconfigured "
-            "in your hosting environment."
-        )
-    elif "drive_folder_id` must be a FOLDER id" in DRIVE_ERROR_MSG:
-        st.warning(
-            "⚠️ `drive_folder_id` is not a folder.\n\n"
-            "If you pasted a Shared Drive ID (URL with '/drives/'), it will not work.\n"
-            "Open the actual folder inside that Shared Drive, copy the link with "
-            "`/folders/`, and use that ID instead."
-        )
-    elif "does not point to a visible file/folder" in DRIVE_ERROR_MSG:
-        st.warning(
-            "⚠️ The service account cannot see the folder specified by `drive_folder_id`.\n\n"
-            "Share the Shared Drive (or that folder) with the service account email "
-            "as at least Viewer, then reload."
-        )
-    else:
-        st.warning(
-            "⚠️ Some other error occurred while connecting to Google Drive.\n\n"
-            "Use the traceback above to fix the configuration, permissions, or network."
-        )
-# -------------------------------------------------------------------
-# Cached analytics helper (GLOBAL, used by Dashboard & invalidated by Import/Manage)
-# -------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def compute_all(d1q: str, d2q: str, camps: Tuple[str, ...], pvals: Tuple[int, ...]):
-    """
-    Central analytics function:
-    - summary_by_camp
-    - summary_by_date
-    - weekly_summary
-    - by_interval
-    - dashboard (Date x Interval x CAMPAIGN grid)
-    - overall stats (for metric cards)
-    """
-    # use the cached DataMgr
-    dm_local = get_dm()
-
-    summary_by_camp = dm_local.get_summary(d1q, d2q, camps, ["CAMPAIGN"], pvals)
-    summary_by_date = dm_local.get_summary(d1q, d2q, camps, ["Date"], pvals)
-    weekly_summary  = dm_local.get_weekly_summary(d1q, d2q, camps, pvals)
-    by_interval     = dm_local.get_summary(d1q, d2q, camps, ["Interval"], pvals)
-    dashboard       = dm_local.get_summary(d1q, d2q, camps, ["Date", "Interval", "CAMPAIGN"], pvals)
-
-    if not summary_by_date.empty:
-        summary_by_date.sort_values(by="Date", ascending=False, inplace=True)
-    if not by_interval.empty:
-        by_interval.sort_values(by="Interval", ascending=True, inplace=True)
-    if not dashboard.empty:
-        dashboard.sort_values(by=["Date", "Interval"], ascending=[False, True], inplace=True)
-
-    stats = dm_local.get_overall_stats(d1q, d2q, camps, pvals)
-    return summary_by_camp, summary_by_date, weekly_summary, by_interval, dashboard, stats
-
-@st.cache_data(show_spinner=False)
-def get_all_campaigns_cached() -> List[str]:
-    """
-    Cached wrapper around DataMgr.get_all_campaigns to avoid
-    scanning all parquet files on every rerun.
-    """
-    return get_dm().get_all_campaigns()
-
+    st.error(f"A critical error occurred during initialization: {e}")
+    st.stop()
 
 with st.sidebar:
     role_badge = "🛡️ Admin" if IS_ADMIN else "👤 User"
@@ -946,30 +731,16 @@ with st.sidebar:
 
     all_needed_dates = {d.strftime(DATE_FMT_QUERY) for d in pd.date_range(d1, d2, freq="D")}
     missing_dates = all_needed_dates - list_local_dates()
-
-    if missing_dates and DRIVE_AVAILABLE and drive is not None and root_folder_id:
+    if missing_dates:
         with lottie_spinner(
                 text=f"Syncing {len(missing_dates)} date partition(s) from Database Server...",
                 height=150, loop=True, speed=1.05
         ):
             ensure_local_partitions_for_dates(drive, root_folder_id, missing_dates)
-    elif missing_dates and not DRIVE_AVAILABLE:
-        st.info(
-            "Some date partitions in the selected range are not cached locally and the "
-            "Database Server is currently unreachable.\n\n"
-            "The dashboard will only show data for dates that are already cached on this server."
-        )
-    all_campaigns = get_all_campaigns_cached()
-    if not all_campaigns:
-        st.info(
-            "No campaigns found in the current data.\n\n"
-            "Make sure you have imported data for the selected date range, "
-            "or that the local cache contains parquet files in `drive_cache/Date=YYYY-MM-DD/`."
-        )
 
+    all_campaigns = dm.get_all_campaigns()
     if "selected_campaigns" not in st.session_state:
         st.session_state.selected_campaigns = [c for c in all_campaigns if c not in UNRECOMMENDED_CAMPAIGNS]
-
     st.write("**Campaigns**")
     c1, c2, c3 = st.columns(3)
     if c1.button("Recommended", use_container_width=True):
@@ -991,15 +762,9 @@ with st.sidebar:
     percentiles = tuple(sorted({int(p0), int(p1), int(p2)}, reverse=True))
     st.divider()
     st.markdown("**☁️ Database Server**")
-    if DRIVE_AVAILABLE:
-        st.success("Connected")
-    else:
-        st.warning("Running in local-only mode (Google Drive unreachable).")
-    st.markdown(
-        '<div class="sidebar-help">Data is organized by date partitions like '
-        '<code>Date=YYYY-MM-DD/</code>. In local-only mode, only cached dates are available.</div>',
-        unsafe_allow_html=True,
-    )
+    st.success("Connected")
+    st.markdown('<div class="sidebar-help">Data is organized by the database date partitions like <code>Date=YYYY-MM-DD/</code>.</div>', unsafe_allow_html=True)
+
 st.title("📞 Dial Speed Analyzer")
 # Build tab list by role
 tab_options = ["Dashboard", "Import Data", "Manage Data"] if IS_ADMIN else ["Dashboard"]
@@ -1020,18 +785,33 @@ if selected_tab == "Dashboard":
     else:
         d1q, d2q = d1.strftime(DATE_FMT_QUERY), d2.strftime(DATE_FMT_QUERY)
 
+        @st.cache_data(show_spinner=False)
+        def compute_all(d1q, d2q, camps, pvals):
+            summary_by_camp = dm.get_summary(d1q, d2q, camps, ["CAMPAIGN"], pvals)
+            summary_by_date = dm.get_summary(d1q, d2q, camps, ["Date"], pvals)
+            weekly_summary = dm.get_weekly_summary(d1q, d2q, camps, pvals)
+            by_interval = dm.get_summary(d1q, d2q, camps, ["Interval"], pvals)
+            dashboard = dm.get_summary(d1q, d2q, camps, ["Date", "Interval", "CAMPAIGN"], pvals)
+
+            if not summary_by_date.empty: summary_by_date.sort_values(by="Date", ascending=False, inplace=True)
+            if not by_interval.empty: by_interval.sort_values(by="Interval", ascending=True, inplace=True)
+            if not dashboard.empty: dashboard.sort_values(by=["Date", "Interval"], ascending=[False, True], inplace=True)
+
+            stats = dm.get_overall_stats(d1q, d2q, camps, pvals)
+            return summary_by_camp, summary_by_date, weekly_summary, by_interval, dashboard, stats
+
+
         with lottie_spinner(text="Running analytics...", height=140, loop=True, speed=1.1):
             by_camp, by_date, by_week, by_interval, dashboard, stats = compute_all(
                 d1q, d2q, tuple(st.session_state.selected_campaigns), percentiles
             )
+
         render_cards(stats, percentiles)
         st.markdown("<br>", unsafe_allow_html=True)
 
         tabs = st.tabs(["Overall Dashboard", "By Campaign", "By Date", "Weekly View", "By Interval"])
-
-        # Use DateColumn instead of DatetimeColumn for nicer display
-        date_column_config = st.column_config.DateColumn("Date", format="DD-MMM-YY")
-        week_date_column_config = st.column_config.DateColumn("Week Date", format="DD-MMM-YY")
+        date_column_config = st.column_config.DatetimeColumn("Date", format="DD-MMM-YY")
+        week_date_column_config = st.column_config.DatetimeColumn("Week Date", format="DD-MMM-YY")
 
         with tabs[0]:
             st.dataframe(dashboard, use_container_width=True, hide_index=True, column_config={"Date": date_column_config})
@@ -1049,20 +829,8 @@ elif selected_tab == "Import Data":
     st.header("📥 Import Data")
     st.info("Required columns: `CAMPAIGNNAME`, `Level1`, `CallStartdate`, `Insert_Dt`, `attempt`, `CallStatus`")
 
-    uploaded_files = st.file_uploader(
-        "Select one or more CSV or Excel files",
-        accept_multiple_files=True,
-        type=["csv", "xls", "xlsx"],
-    )
-
-    import_disabled = not uploaded_files
-    if not DRIVE_AVAILABLE:
-        st.info(
-            "Remote Database Server is currently unreachable.\n\n"
-            "Imported data will be stored only in this app's local cache (`drive_cache/`)."
-        )
-
-    if st.button("Process & Import Files", type="primary", disabled=import_disabled, use_container_width=True):
+    uploaded_files = st.file_uploader("Select one or more CSV or Excel files", accept_multiple_files=True, type=["csv", "xls", "xlsx"])
+    if st.button("Process & Import Files", type="primary", disabled=(not uploaded_files), use_container_width=True):
         total_rows, dfs = 0, []
         progress_bar = st.progress(0, "Starting import...")
         for i, f in enumerate(uploaded_files):
@@ -1082,52 +850,28 @@ elif selected_tab == "Import Data":
         else:
             merged = pd.concat(dfs, ignore_index=True)
             touched = dm.write_partitioned_parquet(merged)
-
             try:
-                if DRIVE_AVAILABLE and drive is not None and root_folder_id:
-                    with lottie_spinner(
-                            text=f"Uploading {len(touched)} date partition(s) to Database...",
-                            height=150, loop=True
-                    ):
-                        upload_new_local_files(drive, root_folder_id, touched)
-                else:
-                    st.warning(
-                        "Skipped upload to remote Database Server because it is not available.\n"
-                        "Data is saved only in the local cache."
-                    )
+                with lottie_spinner(
+                        text=f"Uploading {len(touched)} date partition(s) to Database...",
+                        height=150, loop=True
+                ):
+                    upload_new_local_files(drive, root_folder_id, touched)
 
                 st.success(f"Successfully imported {total_rows:,} rows across {len(touched)} date partition(s).")
 
                 # celebratory animation instead of balloons
                 dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=180, loop=False, speed=1.0)
 
-                # Invalidate analytics + campaign cache
-                if "compute_all" in globals():
-                    compute_all.clear()
-                if "get_all_campaigns_cached" in globals():
-                    get_all_campaigns_cached.clear()
+                compute_all.clear()
 
             except Exception as e:
-                st.error("Data was imported locally, but an error occurred while uploading to Database.")
-                st.exception(e)
-
+                st.error(f"Data was imported locally, but the upload to Database failed: {e}")
         progress_bar.empty()
 
 elif selected_tab == "Manage Data":
     if not IS_ADMIN: st.stop()
     st.header("🧹 Manage Stored Data")
-    if DRIVE_AVAILABLE:
-        st.warning(
-            "**Warning:** Deleting dates will permanently remove the data from both the local cache "
-            "and the remote Database Server.",
-            icon="⚠️",
-        )
-    else:
-        st.warning(
-            "**Warning:** Deleting dates will permanently remove the data from the local cache. "
-            "Remote Database Server is not reachable right now.",
-            icon="⚠️",
-        )
+    st.warning("**Warning:** Deleting dates will permanently remove the data from both the local cache and Database Server.", icon="⚠️")
 
     dates_local = sorted(list_local_dates())
     if not dates_local:
@@ -1148,12 +892,6 @@ elif selected_tab == "Manage Data":
 
                 st.success(f"Successfully deleted {len(sel_dates)} date partition(s).")
                 dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=160, loop=False)
-
-                # Invalidate analytics + campaign cache
-                if "compute_all" in globals():
-                    compute_all.clear()
-                if "get_all_campaigns_cached" in globals():
-                    get_all_campaigns_cached.clear()
 
                 st.rerun()
 
