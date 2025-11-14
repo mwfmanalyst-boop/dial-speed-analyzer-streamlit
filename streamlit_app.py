@@ -5,6 +5,7 @@ import json
 import time
 import shutil
 import hashlib
+import ssl  # <-- NEW: to detect SSL-specific errors
 from datetime import datetime, timedelta, date
 from dateutil import tz
 from typing import Dict, List, Tuple, Optional, Set
@@ -391,15 +392,36 @@ st.markdown('<div class="main-content">', unsafe_allow_html=True)
 # -------------------------------------------------------------------
 @st.cache_resource(show_spinner="Connecting to Database Server...")
 def get_drive_service():
+    """
+    Build a Google Drive client using the service account in st.secrets.
+
+    If there is an SSL/TLS problem in the hosting environment, we raise a
+    clear RuntimeError so the caller can show a meaningful message instead
+    of a confusing low-level SSLError.
+    """
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Service account missing. Add [gcp_service_account] to secrets.")
+        raise RuntimeError(
+            "Service account config missing. Add `gcp_service_account` in Streamlit secrets."
+        )
+
     info = st.secrets["gcp_service_account"]
     if isinstance(info, str):
         info = json.loads(info)
+
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    try:
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except ssl.SSLError as e:
+        # Wrap SSL errors in a clearer message for the UI
+        raise RuntimeError(
+            "SSL error while connecting to Google Drive. "
+            "This is usually due to network/SSL issues in the hosting environment, "
+            "not your app code. Please check that outbound HTTPS to Google APIs "
+            "is allowed from this environment."
+        ) from e
 
 def get_drive_folder_id() -> str:
     fid = st.secrets.get("drive_folder_id")
@@ -689,10 +711,25 @@ try:
     root_folder_id = resolve_shortcut(drive, get_drive_folder_id())
     dm = get_dm()
 except Exception as e:
-    st.error(
-        "A critical error occurred during initialization. "
-        "Please verify `gcp_service_account` and `drive_folder_id` in Streamlit secrets."
-    )
+    msg = str(e)
+
+    # If it's our wrapped SSL error, show a more accurate hint
+    if "SSL error while connecting to Google Drive" in msg:
+        st.error(
+            "Unable to connect securely to Google Drive.\n\n"
+            "This is most likely due to SSL / network restrictions in the environment "
+            "where the app is running (for example, outbound HTTPS to Google APIs is blocked "
+            "or the TLS stack is broken).\n\n"
+            "Your `gcp_service_account` and `drive_folder_id` secrets may be correct, "
+            "but the hosting environment must allow HTTPS to `www.googleapis.com`."
+        )
+    else:
+        st.error(
+            "A critical error occurred during initialization.\n\n"
+            "Please verify `gcp_service_account` and `drive_folder_id` in Streamlit secrets, "
+            "and ensure the environment has outbound HTTPS access to Google Drive."
+        )
+
     # Show full traceback in the app + logs for easier debugging
     st.exception(e)
     st.stop()
