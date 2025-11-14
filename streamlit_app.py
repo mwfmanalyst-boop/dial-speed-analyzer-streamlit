@@ -428,6 +428,67 @@ def get_drive_folder_id() -> str:
     if not fid:
         raise RuntimeError("`drive_folder_id` missing from secrets.")
     return fid
+def init_drive_root():
+    """
+    Resolve the Drive root folder we will use for partitions.
+
+    Supports:
+    - Normal 'My Drive' folders
+    - Shared Drive folders
+    - Shortcuts pointing to either of the above
+
+    Validates that:
+    - drive_folder_id exists
+    - It ultimately points to a FOLDER (not a Shared Drive id, file, etc.)
+    """
+    drive = get_drive_service()
+    raw_id = get_drive_folder_id()  # what you put in st.secrets["drive_folder_id"]
+
+    try:
+        meta = drive.files().get(
+            fileId=raw_id,
+            fields="id,name,mimeType,driveId,shortcutDetails",
+            supportsAllDrives=True,
+        ).execute()
+    except HttpError as e:
+        # Most common issues:
+        #  - ID is from a Shared Drive itself, not from a folder
+        #  - Service account does not have access to that Shared Drive/folder
+        raise RuntimeError(
+            "drive_folder_id does not point to a visible file/folder for this "
+            "service account.\n\n"
+            "If you are using a Shared Drive:\n"
+            "  1) Open the folder that actually contains your Date=YYYY-MM-DD "
+            "     subfolders in the browser.\n"
+            "  2) Copy the link and use the ID after '/folders/' (NOT the 'drives' ID).\n"
+            "  3) Share that folder (or the Shared Drive) with the service account "
+            "     email as at least Viewer/Contributor."
+        ) from e
+
+    # If it's a shortcut, resolve the target
+    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
+        target_id = meta["shortcutDetails"]["targetId"]
+        meta = drive.files().get(
+            fileId=target_id,
+            fields="id,name,mimeType,driveId",
+            supportsAllDrives=True,
+        ).execute()
+    else:
+        target_id = meta["id"]
+
+    if meta["mimeType"] != "application/vnd.google-apps.folder":
+        raise RuntimeError(
+            f"`drive_folder_id` must be a FOLDER id, but it points to an item with "
+            f"mimeType={meta['mimeType']}.\n\n"
+            "If you pasted a Shared Drive ID (from a URL containing '/drives/'), "
+            "that will NOT work. You must create/select a folder inside that "
+            "Shared Drive and use its '/folders/...' ID instead."
+        )
+
+    root_name = meta.get("name")
+    root_drive_id = meta.get("driveId")  # will be non-empty for Shared Drives
+
+    return drive, target_id, root_name, root_drive_id
 
 DRIVE_LIST_KW = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives")
 
@@ -764,16 +825,20 @@ DRIVE_AVAILABLE = False
 DRIVE_ERROR_MSG = ""
 
 try:
-    drive = get_drive_service()
-    root_folder_id = resolve_shortcut(drive, get_drive_folder_id())
+    # NEW: uses Shared-Drive-aware initializer + validates folder
+    drive, root_folder_id, root_name, root_drive_id = init_drive_root()
     DRIVE_AVAILABLE = True
+
+    # Optional small caption so YOU can see what it connected to
+    where = "Shared Drive" if root_drive_id else "My Drive"
+    st.caption(f"✅ Connected to folder '{root_name}' on {where}.")
+
 except Exception as e:
     DRIVE_AVAILABLE = False
     DRIVE_ERROR_MSG = str(e)
 
-    # 👇 show full technical details so you know what's wrong
     st.error("Could not connect to Google Drive. The app is running in local-only mode.")
-    st.exception(e)
+    st.exception(e)  # show full traceback so you can see the exact cause
 
     if "SSL error while connecting to Google Drive" in DRIVE_ERROR_MSG:
         st.warning(
@@ -781,22 +846,24 @@ except Exception as e:
             "Most likely outbound HTTPS to Google APIs is blocked or TLS is misconfigured "
             "in your hosting environment."
         )
-    elif "gcp_service_account" in DRIVE_ERROR_MSG or "service_account" in DRIVE_ERROR_MSG:
+    elif "drive_folder_id` must be a FOLDER id" in DRIVE_ERROR_MSG:
         st.warning(
-            "⚠️ Problem with `gcp_service_account` in `st.secrets`.\n\n"
-            "Check that your service account JSON is correct and pasted as a single JSON object."
+            "⚠️ `drive_folder_id` is not a folder.\n\n"
+            "If you pasted a Shared Drive ID (URL with '/drives/'), it will not work.\n"
+            "Open the actual folder inside that Shared Drive, copy the link with "
+            "`/folders/`, and use that ID instead."
         )
-    elif "`drive_folder_id` missing" in DRIVE_ERROR_MSG:
+    elif "does not point to a visible file/folder" in DRIVE_ERROR_MSG:
         st.warning(
-            "⚠️ `drive_folder_id` is missing from `st.secrets`.\n\n"
-            "Set it to the folder ID that directly contains the `Date=YYYY-MM-DD` subfolders."
+            "⚠️ The service account cannot see the folder specified by `drive_folder_id`.\n\n"
+            "Share the Shared Drive (or that folder) with the service account email "
+            "as at least Viewer, then reload."
         )
     else:
         st.warning(
             "⚠️ Some other error occurred while connecting to Google Drive.\n\n"
             "Use the traceback above to fix the configuration, permissions, or network."
         )
-
 # -------------------------------------------------------------------
 # Cached analytics helper (GLOBAL, used by Dashboard & invalidated by Import/Manage)
 # -------------------------------------------------------------------
