@@ -441,7 +441,8 @@ def create_subfolder(drive, parent_id: str, name: str) -> str:
 
 def download_file(drive, file_id: str, local_path: str):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    request = drive.files().get_media(fileId=file_id)
+    request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+
     with io.FileIO(local_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -688,8 +689,55 @@ try:
     root_folder_id = resolve_shortcut(drive, get_drive_folder_id())
     dm = get_dm()
 except Exception as e:
-    st.error(f"A critical error occurred during initialization: {e}")
+    st.error(
+        "A critical error occurred during initialization. "
+        "Please verify `gcp_service_account` and `drive_folder_id` in Streamlit secrets."
+    )
+    # Show full traceback in the app + logs for easier debugging
+    st.exception(e)
     st.stop()
+
+# -------------------------------------------------------------------
+# Cached analytics helper (GLOBAL, used by Dashboard & invalidated by Import/Manage)
+# -------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def compute_all(d1q: str, d2q: str, camps: Tuple[str, ...], pvals: Tuple[int, ...]):
+    """
+    Central analytics function:
+    - summary_by_camp
+    - summary_by_date
+    - weekly_summary
+    - by_interval
+    - dashboard (Date x Interval x CAMPAIGN grid)
+    - overall stats (for metric cards)
+    """
+    # use the cached DataMgr
+    dm_local = get_dm()
+
+    summary_by_camp = dm_local.get_summary(d1q, d2q, camps, ["CAMPAIGN"], pvals)
+    summary_by_date = dm_local.get_summary(d1q, d2q, camps, ["Date"], pvals)
+    weekly_summary  = dm_local.get_weekly_summary(d1q, d2q, camps, pvals)
+    by_interval     = dm_local.get_summary(d1q, d2q, camps, ["Interval"], pvals)
+    dashboard       = dm_local.get_summary(d1q, d2q, camps, ["Date", "Interval", "CAMPAIGN"], pvals)
+
+    if not summary_by_date.empty:
+        summary_by_date.sort_values(by="Date", ascending=False, inplace=True)
+    if not by_interval.empty:
+        by_interval.sort_values(by="Interval", ascending=True, inplace=True)
+    if not dashboard.empty:
+        dashboard.sort_values(by=["Date", "Interval"], ascending=[False, True], inplace=True)
+
+    stats = dm_local.get_overall_stats(d1q, d2q, camps, pvals)
+    return summary_by_camp, summary_by_date, weekly_summary, by_interval, dashboard, stats
+
+@st.cache_data(show_spinner=False)
+def get_all_campaigns_cached() -> List[str]:
+    """
+    Cached wrapper around DataMgr.get_all_campaigns to avoid
+    scanning all parquet files on every rerun.
+    """
+    return get_dm().get_all_campaigns()
+
 
 with st.sidebar:
     role_badge = "🛡️ Admin" if IS_ADMIN else "👤 User"
@@ -738,9 +786,10 @@ with st.sidebar:
         ):
             ensure_local_partitions_for_dates(drive, root_folder_id, missing_dates)
 
-    all_campaigns = dm.get_all_campaigns()
+    all_campaigns = get_all_campaigns_cached()
     if "selected_campaigns" not in st.session_state:
         st.session_state.selected_campaigns = [c for c in all_campaigns if c not in UNRECOMMENDED_CAMPAIGNS]
+
     st.write("**Campaigns**")
     c1, c2, c3 = st.columns(3)
     if c1.button("Recommended", use_container_width=True):
@@ -785,27 +834,10 @@ if selected_tab == "Dashboard":
     else:
         d1q, d2q = d1.strftime(DATE_FMT_QUERY), d2.strftime(DATE_FMT_QUERY)
 
-        @st.cache_data(show_spinner=False)
-        def compute_all(d1q, d2q, camps, pvals):
-            summary_by_camp = dm.get_summary(d1q, d2q, camps, ["CAMPAIGN"], pvals)
-            summary_by_date = dm.get_summary(d1q, d2q, camps, ["Date"], pvals)
-            weekly_summary = dm.get_weekly_summary(d1q, d2q, camps, pvals)
-            by_interval = dm.get_summary(d1q, d2q, camps, ["Interval"], pvals)
-            dashboard = dm.get_summary(d1q, d2q, camps, ["Date", "Interval", "CAMPAIGN"], pvals)
-
-            if not summary_by_date.empty: summary_by_date.sort_values(by="Date", ascending=False, inplace=True)
-            if not by_interval.empty: by_interval.sort_values(by="Interval", ascending=True, inplace=True)
-            if not dashboard.empty: dashboard.sort_values(by=["Date", "Interval"], ascending=[False, True], inplace=True)
-
-            stats = dm.get_overall_stats(d1q, d2q, camps, pvals)
-            return summary_by_camp, summary_by_date, weekly_summary, by_interval, dashboard, stats
-
-
         with lottie_spinner(text="Running analytics...", height=140, loop=True, speed=1.1):
             by_camp, by_date, by_week, by_interval, dashboard, stats = compute_all(
                 d1q, d2q, tuple(st.session_state.selected_campaigns), percentiles
             )
-
         render_cards(stats, percentiles)
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -862,7 +894,11 @@ elif selected_tab == "Import Data":
                 # celebratory animation instead of balloons
                 dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=180, loop=False, speed=1.0)
 
-                compute_all.clear()
+                # Invalidate analytics + campaign cache
+                if "compute_all" in globals():
+                    compute_all.clear()
+                if "get_all_campaigns_cached" in globals():
+                    get_all_campaigns_cached.clear()
 
             except Exception as e:
                 st.error(f"Data was imported locally, but the upload to Database failed: {e}")
@@ -892,6 +928,12 @@ elif selected_tab == "Manage Data":
 
                 st.success(f"Successfully deleted {len(sel_dates)} date partition(s).")
                 dotlottie_player(DOTLOTTIE_SUCCESS_URL, height=160, loop=False)
+
+                # Invalidate analytics + campaign cache
+                if "compute_all" in globals():
+                    compute_all.clear()
+                if "get_all_campaigns_cached" in globals():
+                    get_all_campaigns_cached.clear()
 
                 st.rerun()
 
