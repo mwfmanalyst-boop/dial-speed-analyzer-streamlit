@@ -753,6 +753,9 @@ def render_cards(stats: Dict[str, int], percentiles: Tuple[int, ...]):
 # -------------------------------------------------------------------
 # Main after login
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Main after login
+# -------------------------------------------------------------------
 dm = get_dm()  # Always available for local parquet cache
 
 drive = None
@@ -768,24 +771,30 @@ except Exception as e:
     DRIVE_AVAILABLE = False
     DRIVE_ERROR_MSG = str(e)
 
-    # If it's our wrapped SSL error, show a more accurate hint
+    # 👇 show full technical details so you know what's wrong
+    st.error("Could not connect to Google Drive. The app is running in local-only mode.")
+    st.exception(e)
+
     if "SSL error while connecting to Google Drive" in DRIVE_ERROR_MSG:
         st.warning(
-            "⚠️ Unable to connect securely to Google Drive.\n\n"
-            "This is most likely due to SSL / network restrictions in the environment "
-            "where the app is running (for example, outbound HTTPS to Google APIs is blocked "
-            "or the TLS stack is broken).\n\n"
-            "Your `gcp_service_account` and `drive_folder_id` secrets may be correct, "
-            "but the hosting environment must allow HTTPS to `www.googleapis.com`.\n\n"
-            "The app will continue in *local-only* mode. You can still import data and "
-            "analyze it, but remote sync will be skipped."
+            "⚠️ SSL error while talking to Google Drive.\n\n"
+            "Most likely outbound HTTPS to Google APIs is blocked or TLS is misconfigured "
+            "in your hosting environment."
+        )
+    elif "gcp_service_account" in DRIVE_ERROR_MSG or "service_account" in DRIVE_ERROR_MSG:
+        st.warning(
+            "⚠️ Problem with `gcp_service_account` in `st.secrets`.\n\n"
+            "Check that your service account JSON is correct and pasted as a single JSON object."
+        )
+    elif "`drive_folder_id` missing" in DRIVE_ERROR_MSG:
+        st.warning(
+            "⚠️ `drive_folder_id` is missing from `st.secrets`.\n\n"
+            "Set it to the folder ID that directly contains the `Date=YYYY-MM-DD` subfolders."
         )
     else:
         st.warning(
-            "⚠️ Could not connect to the remote Database Server (Google Drive).\n\n"
-            "The app will run in *local-only* mode using whatever data is cached "
-            "on this server. Remote sync / upload / delete will be skipped.\n\n"
-            f"Details: {DRIVE_ERROR_MSG}"
+            "⚠️ Some other error occurred while connecting to Google Drive.\n\n"
+            "Use the traceback above to fix the configuration, permissions, or network."
         )
 
 # -------------------------------------------------------------------
